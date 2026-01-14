@@ -1,0 +1,19 @@
+# Build artifacts
+bin/
+obj/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Publish outputs
+**/publish/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

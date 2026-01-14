@@ -1,0 +1,16 @@
+[Unit]
+Description=DaemonQueueQuery Worker Service
+After=network.target
+
+[Service]
+Type=notify
+WorkingDirectory=/opt/daemonqueuequery
+ExecStart=/usr/bin/dotnet /opt/daemonqueuequery/DaemonQueueQuery.dll
+Restart=always
+RestartSec=5
+Environment=DOTNET_ENVIRONMENT=Production
+# Uncomment and set as needed
+# Environment=ConnectionStrings__DefaultConnection=Server=plataformas1;Database=master;User ID=tu_usuario;Password=tu_contrasena;TrustServerCertificate=True;
+
+[Install]
+WantedBy=multi-user.target
