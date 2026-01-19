@@ -3,6 +3,8 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using System.Data;
+using System.Text;
+using System.Xml;
 
 namespace ColaWorker
 {
@@ -13,106 +15,182 @@ namespace ColaWorker
         private readonly int _maxHilos;
         private readonly int _tiempoEsperaMs;
 
-        private readonly string _uspProcesarSiguiente ;
-
         public GestorDeColas(ILogger<GestorDeColas> logger, IConfiguration configuration)
         {
             _logger = logger;
             _connectionString = configuration.GetConnectionString("DefaultConnection") 
                                 ?? throw new ArgumentNullException("ConnectionStrings:DefaultConnection");
             
+            // Configuración por defecto: 2 hilos, 1 segundo de espera si cola vacía
             _maxHilos = configuration.GetValue<int>("WorkerSettings:MaxHilos", 2);
             _tiempoEsperaMs = configuration.GetValue<int>("WorkerSettings:TiempoEsperaSiVacioMs", 1000);
-            _uspProcesarSiguiente = configuration.GetValue<string>("WorkerSettings:UspProcesarSiguiente", "");
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation($"Iniciando Gestor de Colas con {_maxHilos} hilos concurrentes.");
+            _logger.LogInformation($"Iniciando Gestor de Colas (Modo Ejecución C#) con {_maxHilos} hilos.");
 
-            // Creamos una lista de Tareas (Tasks), cada una representa un "Hilo" o Worker independiente
             var tareasWorkers = new List<Task>();
 
+            // Lanzamos N tareas en paralelo
             for (int i = 0; i < _maxHilos; i++)
             {
                 int workerId = i + 1;
-                // Iniciamos cada worker en paralelo sin esperar a que termine (Fire and Forget controlado)
                 tareasWorkers.Add(Task.Run(() => CicloDeProcesamiento(workerId, stoppingToken), stoppingToken));
             }
 
-            // Esperamos a que todos terminen (solo ocurrirá si se cancela la app)
+            // Mantenemos la ejecución viva hasta que se cancele el servicio
             await Task.WhenAll(tareasWorkers);
         }
 
         private async Task CicloDeProcesamiento(int workerId, CancellationToken token)
         {
-            _logger.LogInformation($"Worker #{workerId} iniciado.");
+            _logger.LogInformation($"Worker #{workerId} listo para procesar.");
 
             while (!token.IsCancellationRequested)
             {
-                bool trabajoEncontrado = false;
-
                 try
                 {
-                    // Llamamos a la base de datos
-                    trabajoEncontrado = await EjecutarSPProcesarSiguiente();
+                    // 1. Obtener Siguiente Tarea (Reserva en DB usando SP atómico)
+                    var tarea = await ObtenerSiguienteTareaAsync();
+
+                    if (tarea == null)
+                    {
+                        // Cola vacía, dormir para no saturar CPU/DB
+                        await Task.Delay(_tiempoEsperaMs, token);
+                        continue;
+                    }
+
+                    _logger.LogInformation($"Worker #{workerId}: Procesando petición {tarea.Id}...");
+
+                    // 2. Ejecutar la Query del Usuario y serializar a XML
+                    string? resultadoXml = null;
+                    string? errorMsg = null;
+
+                    try
+                    {
+                        resultadoXml = await EjecutarQueryUsuarioYSerializar(tarea.QuerySql);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Capturamos error de sintaxis o ejecución SQL del usuario
+                        errorMsg = ex.Message;
+                        _logger.LogError($"Worker #{workerId}: Error en query usuario. {ex.Message}");
+                    }
+
+                    // 3. Guardar Resultado o Error en DB
+                    await GuardarRespuestaAsync(tarea.Id, resultadoXml, errorMsg);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, $"Error crítico en Worker #{workerId}. Reintentando en 5 seg...");
-                    try { await Task.Delay(5000, token); } catch { /* Ignorar cancelación durante espera error */ }
-                    continue; 
-                }
-
-                if (!trabajoEncontrado)
-                {
-                    // Si la cola estaba vacía, dormimos un poco para no saturar la CPU/DB
-                    // Esto convierte el bucle en un "Polling eficiente"
-                    // _logger.LogDebug($"Worker #{workerId}: Cola vacía, durmiendo...");
-                    try 
-                    { 
-                        await Task.Delay(_tiempoEsperaMs, token); 
-                    } 
-                    catch (TaskCanceledException) 
-                    { 
-                        break; 
-                    }
-                }
-                else
-                {
-                    // Si encontró trabajo, no dormimos. Volvemos a consultar inmediatamente
-                    // para vaciar la cola lo más rápido posible.
-                    _logger.LogInformation($"Worker #{workerId}: Tarea procesada con éxito.");
+                    // Error crítico de infraestructura (ej. se cayó la conexión con el servidor de colas)
+                    _logger.LogError(ex, $"Error de infraestructura en Worker #{workerId}. Reintentando en 5s...");
+                    await Task.Delay(5000, token);
                 }
             }
-
-            _logger.LogInformation($"Worker #{workerId} detenido.");
         }
 
-        private async Task<bool> EjecutarSPProcesarSiguiente()
+        // DTO simple interna
+        private class TareaCola { public Guid Id { get; set; } public string QuerySql { get; set; } = string.Empty; }
+
+        private async Task<TareaCola?> ObtenerSiguienteTareaAsync()
         {
-            using (var connection = new SqlConnection(_connectionString))
+            using var conn = new SqlConnection(_connectionString);
+            await conn.OpenAsync();
+
+            using var cmd = new SqlCommand("dbo.usp_ObtenerSiguientePeticion", conn);
+            cmd.CommandType = CommandType.StoredProcedure;
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
             {
-                await connection.OpenAsync();
-
-                using (var command = new SqlCommand(_uspProcesarSiguiente, connection))
+                return new TareaCola
                 {
-                    command.CommandType = CommandType.StoredProcedure;
-                    
-                    // Capturamos el valor de retorno (RETURN @TrabajoRealizado)
-                    var returnParameter = command.Parameters.Add("@ReturnVal", SqlDbType.Int);
-                    returnParameter.Direction = ParameterDirection.ReturnValue;
-
-                    // El timeout debe ser alto porque el SP simula trabajo (WAITFOR)
-                    command.CommandTimeout = 300; 
-
-                    await command.ExecuteNonQueryAsync();
-
-                    // 1 = Hubo trabajo, 0 = No hubo trabajo
-                    int resultado = (int)returnParameter.Value;
-                    return resultado == 1;
-                }
+                    Id = reader.GetGuid(0),
+                    QuerySql = reader.GetString(1)
+                };
             }
+            return null;
+        }
+
+        private async Task GuardarRespuestaAsync(Guid idPeticion, string? xml, string? error)
+        {
+            using var conn = new SqlConnection(_connectionString);
+            await conn.OpenAsync();
+
+            using var cmd = new SqlCommand("dbo.usp_GuardarRespuesta", conn);
+            cmd.CommandType = CommandType.StoredProcedure;
+            cmd.Parameters.AddWithValue("@IdPeticion", idPeticion);
+            // Manejo correcto de DBNull para parámetros opcionales
+            cmd.Parameters.AddWithValue("@ResultadoXml", (object?)xml ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@MensajeError", (object?)error ?? DBNull.Value);
+
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        private async Task<string?> EjecutarQueryUsuarioYSerializar(string querySql)
+        {
+            // Ejecutamos la query arbitraria del usuario
+            // NOTA: Aquí podrías usar una cadena de conexión distinta (ej. solo lectura) si quisieras aislar entornos.
+            using var conn = new SqlConnection(_connectionString);
+            await conn.OpenAsync();
+
+            using var cmd = new SqlCommand(querySql, conn);
+            // Importante: Aumentar timeout para queries pesadas que pueda mandar el usuario
+            cmd.CommandTimeout = 300; 
+
+            // Usamos DataAdapter para llenar un DataSet automáticamente
+            // Esto maneja SPs, SELECTs y resultados vacíos sin problemas.
+            using var adapter = new SqlDataAdapter(cmd);
+            var ds = new DataSet();
+            
+            adapter.Fill(ds);
+
+            // Si no devuelve tablas o filas
+            if (ds.Tables.Count == 0 || ds.Tables[0].Rows.Count == 0)
+            {
+                return null; 
+            }
+
+            DataTable dt = ds.Tables[0];
+            
+            // Serialización manual a XML compatible con el formato que espera T-SQL
+            // Estructura esperada por usp_EsperarRespuesta: <Resultado><Fila><Col1>Val</Col1></Fila>...</Resultado>
+            
+            var sb = new StringBuilder();
+            // OmitXmlDeclaration para no generar <?xml version...?> que a veces molesta en SQL
+            var settings = new XmlWriterSettings { OmitXmlDeclaration = true, Indent = false };
+
+            using (var writer = XmlWriter.Create(sb, settings))
+            {
+                writer.WriteStartElement("Resultado");
+                
+                foreach (DataRow row in dt.Rows)
+                {
+                    writer.WriteStartElement("Fila");
+                    foreach (DataColumn col in dt.Columns)
+                    {
+                        var val = row[col];
+                        if (val != DBNull.Value)
+                        {
+                            // Si la columna no tiene nombre (ej: SELECT GETDATE()), le damos uno genérico
+                            string colName = string.IsNullOrWhiteSpace(col.ColumnName) ? "Valor_Sin_Alias" : col.ColumnName;
+                            
+                            // Aseguramos que el nombre de la columna sea un tag XML válido (espacios a guiones bajos, etc.)
+                            colName = XmlConvert.EncodeName(colName);
+
+                            writer.WriteStartElement(colName);
+                            writer.WriteString(val.ToString());
+                            writer.WriteEndElement();
+                        }
+                    }
+                    writer.WriteEndElement(); // Fin Fila
+                }
+                
+                writer.WriteEndElement(); // Fin Resultado
+            }
+
+            return sb.ToString();
         }
     }
 }
